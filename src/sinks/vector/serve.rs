@@ -51,9 +51,15 @@ impl proto::Service for ServeService {
         let emitter = self.emitter.subscribe();
         let mut stream = tokio_stream::wrappers::BroadcastStream::new(emitter);
         Ok(tonic::Response::new(Box::pin(async_stream::stream! {
-            while let Some(events) = tokio_stream::StreamExt::next(&mut stream).await {
+            while let Some(result) = tokio_stream::StreamExt::next(&mut stream).await {
             yield Ok(proto::PullEventsResponse {
-                events: events.unwrap()
+                events: match result {
+                    Ok(events) => events,
+                    Err(err) => {
+                        error!(message = "Received an error from stream", %err);
+                        break;
+                    }
+                }
             });
         }
         })))
@@ -69,7 +75,7 @@ struct EventBatch {
 pub struct ServeSink {
     pub emitter: tokio::sync::broadcast::Sender<Vec<crate::event::proto::EventWrapper>>,
     pub batch_settings: BatcherSettings,
-    pub shutdown_trigger: Trigger
+    pub shutdown_trigger: Trigger,
 }
 
 #[async_trait::async_trait]

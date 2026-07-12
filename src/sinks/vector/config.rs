@@ -13,10 +13,10 @@ use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
 use hyper_proxy::ProxyConnector;
-use tonic::{body::BoxBody, transport::server::RoutesBuilder};
-use vector_lib::{configurable::configurable_component, shutdown::ShutdownSignal};
 use tokio::sync::Semaphore;
+use tonic::{body::BoxBody, transport::server::RoutesBuilder};
 use tower::{Service, ServiceBuilder};
+use vector_lib::{configurable::configurable_component, shutdown::ShutdownSignal};
 
 use super::{
     VectorSinkError,
@@ -55,6 +55,12 @@ pub enum VectorMode {
     Serve,
 }
 
+impl Default for VectorMode {
+    fn default() -> Self {
+        Self::Push
+    }
+}
+
 /// Configuration for the `vector` sink.
 #[configurable_component(sink("vector", "Relay observability data to a Vector instance."))]
 #[derive(Clone, Debug)]
@@ -67,6 +73,7 @@ pub struct VectorConfig {
     version: Option<super::VectorConfigVersion>,
 
     /// Mode
+    #[serde(default)]
     mode: VectorMode,
 
     /// The downstream Vector address to which to connect.
@@ -246,89 +253,90 @@ impl SinkConfig for VectorConfig {
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
         match self.mode {
             VectorMode::Push => {
-        let uris = self.uris(tls.is_tls())?;
-        let endpoint_strategy = self
-            .routing
-            .as_ref()
-            .map_or_else(EndpointStrategy::default, |routing| routing.strategy);
+                let uris = self.uris(tls.is_tls())?;
+                let endpoint_strategy = self
+                    .routing
+                    .as_ref()
+                    .map_or_else(EndpointStrategy::default, |routing| routing.strategy);
 
-        let client = new_client(&tls, cx.proxy(), self.keepalive)?;
+                let client = new_client(&tls, cx.proxy(), self.keepalive)?;
 
-        let healthcheck = healthchecks(client.clone(), &uris, cx.healthcheck, endpoint_strategy);
-        let request_settings = self.request.into_settings();
-        let batch_settings = self.batch.into_batcher_settings()?;
+                let healthcheck =
+                    healthchecks(client.clone(), &uris, cx.healthcheck, endpoint_strategy);
+                let request_settings = self.request.into_settings();
+                let batch_settings = self.batch.into_batcher_settings()?;
 
-        let services = uris
-            .into_iter()
-            .map(|uri| {
-                let endpoint = uri.to_string();
-                let service = VectorService::new(client.clone(), uri, self.compression);
-                (endpoint, service)
-            })
-            .collect::<Vec<_>>();
+                let services = uris
+                    .into_iter()
+                    .map(|uri| {
+                        let endpoint = uri.to_string();
+                        let service = VectorService::new(client.clone(), uri, self.compression);
+                        (endpoint, service)
+                    })
+                    .collect::<Vec<_>>();
 
-        let sink = match endpoint_strategy {
-            _ if services.len() == 1 => {
-                let service = ServiceBuilder::new()
-                    .settings(request_settings, VectorGrpcRetryLogic)
-                    .service(services.into_iter().next().expect("one service").1);
+                let sink = match endpoint_strategy {
+                    _ if services.len() == 1 => {
+                        let service = ServiceBuilder::new()
+                            .settings(request_settings, VectorGrpcRetryLogic)
+                            .service(services.into_iter().next().expect("one service").1);
 
-                VectorSinkType::from_event_streamsink(VectorSink {
-                    batch_settings,
-                    service,
-                })
-            }
-            EndpointStrategy::LoadBalance => {
-                let service = request_settings.distributed_service(
-                    VectorGrpcRetryLogic,
-                    services,
-                    self.routing
-                        .as_ref()
-                        .and_then(|routing| routing.health.clone())
-                        .unwrap_or_else(default_endpoint_health_config),
-                    VectorGrpcHealthLogic,
-                    1,
-                );
-
-                VectorSinkType::from_event_streamsink(VectorSink {
-                    batch_settings,
-                    service,
-                })
-            }
-            EndpointStrategy::Failover | EndpointStrategy::FailoverPrimary => {
-                let endpoint_timeout = request_settings.timeout;
-                let max_endpoint_attempts = match endpoint_strategy {
-                    EndpointStrategy::Failover => services.len(),
-                    EndpointStrategy::FailoverPrimary => services.len() + 1,
+                        VectorSinkType::from_event_streamsink(VectorSink {
+                            batch_settings,
+                            service,
+                        })
+                    }
                     EndpointStrategy::LoadBalance => {
-                        unreachable!("load balancing uses a different service")
+                        let service = request_settings.distributed_service(
+                            VectorGrpcRetryLogic,
+                            services,
+                            self.routing
+                                .as_ref()
+                                .and_then(|routing| routing.health.clone())
+                                .unwrap_or_else(default_endpoint_health_config),
+                            VectorGrpcHealthLogic,
+                            1,
+                        );
+
+                        VectorSinkType::from_event_streamsink(VectorSink {
+                            batch_settings,
+                            service,
+                        })
+                    }
+                    EndpointStrategy::Failover | EndpointStrategy::FailoverPrimary => {
+                        let endpoint_timeout = request_settings.timeout;
+                        let max_endpoint_attempts = match endpoint_strategy {
+                            EndpointStrategy::Failover => services.len(),
+                            EndpointStrategy::FailoverPrimary => services.len() + 1,
+                            EndpointStrategy::LoadBalance => {
+                                unreachable!("load balancing uses a different service")
+                            }
+                        };
+                        let failover_request_settings = failover_request_settings(
+                            request_settings,
+                            endpoint_timeout,
+                            max_endpoint_attempts,
+                        );
+
+                        let service = ServiceBuilder::new()
+                            .settings(failover_request_settings, VectorGrpcRetryLogic)
+                            .service(FailoverVectorService::new(
+                                services
+                                    .into_iter()
+                                    .map(|(_endpoint, service)| service)
+                                    .collect(),
+                                endpoint_timeout,
+                                endpoint_strategy,
+                            ));
+
+                        VectorSinkType::from_event_streamsink(VectorSink {
+                            batch_settings,
+                            service,
+                        })
                     }
                 };
-                let failover_request_settings = failover_request_settings(
-                    request_settings,
-                    endpoint_timeout,
-                    max_endpoint_attempts,
-                );
 
-                let service = ServiceBuilder::new()
-                    .settings(failover_request_settings, VectorGrpcRetryLogic)
-                    .service(FailoverVectorService::new(
-                        services
-                            .into_iter()
-                            .map(|(_endpoint, service)| service)
-                            .collect(),
-                        endpoint_timeout,
-                        endpoint_strategy,
-                    ));
-
-                VectorSinkType::from_event_streamsink(VectorSink {
-                    batch_settings,
-                    service,
-                })
-            }
-        };
-
-        Ok((sink, Box::pin(healthcheck)))
+                Ok((sink, Box::pin(healthcheck)))
             }
             VectorMode::Serve => {
                 let (emitter, _) = tokio::sync::broadcast::channel(10000);
@@ -342,13 +350,15 @@ impl SinkConfig for VectorConfig {
 
                 let (shutdown_trigger, shutdown_signal, _) = ShutdownSignal::new_wired();
                 let source = run_grpc_server_with_routes(
-                    self.address.as_ref().ok_or_else(
-                        || -> crate::Error {
+                    self.address
+                        .as_ref()
+                        .ok_or_else(|| -> crate::Error {
                             "address must be defined if mode is serve".into()
-                        }
-                    )?.parse::<std::net::SocketAddr>().map_err(|_| -> crate::Error {
-                        "failed to parse address into SocketAddr".into()
-                    })?,
+                        })?
+                        .parse::<std::net::SocketAddr>()
+                        .map_err(|_| -> crate::Error {
+                            "failed to parse address into SocketAddr".into()
+                        })?,
                     tls,
                     builder.routes(),
                     GrpcKeepaliveConfig::default(),

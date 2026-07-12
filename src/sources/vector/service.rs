@@ -1,6 +1,7 @@
-use std::task::{Context, Poll};
 use snafu::Snafu;
+use std::task::{Context, Poll};
 
+use super::compression::VectorCompression;
 use futures::{TryFutureExt, future::BoxFuture};
 use http::Uri;
 use hyper::client::HttpConnector;
@@ -9,10 +10,7 @@ use hyper_proxy::ProxyConnector;
 use prost::Message;
 use tonic::{IntoRequest, body::BoxBody};
 use tower::Service;
-use vector_lib::{
-    request_metadata::{MetaDescriptive, RequestMetadata}
-};
-use super::compression::VectorCompression;
+use vector_lib::request_metadata::{MetaDescriptive, RequestMetadata};
 
 use crate::{
     Error,

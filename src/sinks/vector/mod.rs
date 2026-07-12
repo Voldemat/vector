@@ -3,9 +3,9 @@ use vector_lib::configurable::configurable_component;
 
 mod compression;
 mod config;
+mod serve;
 mod service;
 mod sink;
-mod serve;
 
 pub use config::VectorConfig;
 

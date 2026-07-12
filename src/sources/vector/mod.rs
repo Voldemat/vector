@@ -160,11 +160,17 @@ async fn handle_batch_status(receiver: Option<BatchStatusReceiver>) -> Result<()
 #[derive(Clone, Debug)]
 pub enum VectorMode {
     #[serde(rename = "fetch")]
-    #[configurable(description = "something")]
+    #[configurable(description = "fetch mode")]
     Fetch,
     #[serde(rename = "receive")]
-    #[configurable(description = "something")]
+    #[configurable(description = "receive mode")]
     Receive,
+}
+
+impl Default for VectorMode {
+    fn default() -> Self {
+        VectorMode::Receive
+    }
 }
 
 /// Configuration for the `vector` source.
@@ -183,6 +189,7 @@ pub struct VectorConfig {
     /// The mode of vector source
     ///
     /// push or pull
+    #[serde(default)]
     pub mode: VectorMode,
 
     #[configurable(derived)]
@@ -198,6 +205,7 @@ pub struct VectorConfig {
     keepalive: GrpcKeepaliveConfig,
 
     /// Somrething something
+    #[serde(default)]
     pub healthcheck: SinkHealthcheckOptions,
 
     /// The namespace to use for logs. This overrides the global setting.
@@ -360,10 +368,9 @@ impl SourceConfig for VectorConfig {
                 Ok(Box::pin(source))
             }
             VectorMode::Fetch => {
-                let client = new_client(&tls_settings, &cx.proxy).unwrap();
-                let uri = with_default_scheme(&format!("{}", self.address), tls_settings.is_tls())
-                    .unwrap();
-                let service = service::VectorService::new(client, uri, VectorCompression::None);
+                let client = new_client(&tls_settings, &cx.proxy)?;
+                let uri = with_default_scheme(&format!("{}", self.address), tls_settings.is_tls())?;
+                let service = service::VectorService::new(client, uri, VectorCompression::Gzip);
                 let mut service = ServiceBuilder::new()
                     .settings(
                         TowerRequestSettings {
@@ -390,18 +397,18 @@ impl SourceConfig for VectorConfig {
                             request: proto::PullEventsRequest {},
                         },
                     )
-                    .await
-                    .unwrap();
+                    .await.map_err(|e| {
+                        error!(message = "Failed to call grpc pull_events handler", %e);
+                            ()
+                    })?;
                     loop {
                         tokio::select! {
                             _ = &mut cx.shutdown => {
-                                println!("Shutdown signal received");
                                 break;
                             }
                             message_res = stream.message() => {
                                 match message_res {
                                     Ok(Some(response)) => {
-                                        println!("Stream loop iteration");
                                         let events = response
                                             .events
                                             .into_iter()
@@ -413,11 +420,10 @@ impl SourceConfig for VectorConfig {
                                         }
                                     }
                                     Ok(None) => {
-                                        println!("Stream closed by the remote server.");
                                         break;
                                     }
-                                    Err(e) => {
-                                        eprintln!("Error reading from stream: {:?}", e);
+                                    Err(_) => {
+                                        error!("Error reading from stream");
                                         break;
                                     }
                                 }
