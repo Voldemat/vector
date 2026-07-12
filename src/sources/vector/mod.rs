@@ -1,5 +1,11 @@
 //! The `vector` source. See [VectorConfig].
+use http::Uri;
+use hyper::client::HttpConnector;
+use hyper_openssl::HttpsConnector;
+use hyper_proxy::ProxyConnector;
 use std::net::SocketAddr;
+use tonic::body::BoxBody;
+use tower::ServiceBuilder;
 
 use chrono::Utc;
 use futures::TryFutureExt;
@@ -10,25 +16,38 @@ use vector_lib::{
     codecs::NativeDeserializerConfig,
     config::LogNamespace,
     configurable::configurable_component,
-    event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event},
+    event::{BatchNotifier, BatchStatus, BatchStatusReceiver, Event, EventFinalizers},
     internal_event::{CountByteSize, InternalEventHandle as _},
+    request_metadata::RequestMetadata,
 };
+mod compression;
+mod service;
 
 use crate::{
     SourceSender,
     config::{
-        DataType, GenerateConfig, Resource, SourceAcknowledgementsConfig, SourceConfig,
-        SourceContext, SourceOutput,
+        DataType, GenerateConfig, ProxyConfig, Resource, SinkHealthcheckOptions,
+        SourceAcknowledgementsConfig, SourceConfig, SourceContext, SourceOutput,
     },
+    http::build_proxy_connector,
     internal_events::{EventsReceived, StreamClosedError},
     proto::vector as proto,
     serde::bool_or_struct,
+    sinks::{
+        prelude::RetryLogic,
+        util::{
+            ServiceBuilderExt, TowerRequestSettings,
+            adaptive_concurrency::AdaptiveConcurrencySettings, retries::JitterMode,
+        },
+    },
     sources::{
         Source,
         util::grpc::{GrpcKeepaliveConfig, run_grpc_server_with_routes},
     },
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
+
+use self::compression::VectorCompression;
 
 /// Marker type for version two of the configuration for the `vector` source.
 #[configurable_component]
@@ -102,6 +121,25 @@ impl proto::Service for Service {
 
         Ok(Response::new(message))
     }
+
+    type PullEventsStream = std::pin::Pin<
+        Box<
+            dyn tonic::codegen::tokio_stream::Stream<
+                    Item = std::result::Result<proto::PullEventsResponse, tonic::Status>,
+                > + Send
+                + 'static,
+        >,
+    >;
+
+    async fn pull_events(
+        &self,
+        _: Request<proto::PullEventsRequest>,
+    ) -> Result<Response<Self::PullEventsStream>, Status> {
+        Err(Status::new(
+            tonic::Code::Unimplemented,
+            "Source vector does not support PullEventsRequest",
+        ))
+    }
 }
 
 async fn handle_batch_status(receiver: Option<BatchStatusReceiver>) -> Result<(), Status> {
@@ -117,6 +155,18 @@ async fn handle_batch_status(receiver: Option<BatchStatusReceiver>) -> Result<()
     }
 }
 
+#[configurable_component()]
+#[configurable(description = "vector mode")]
+#[derive(Clone, Debug)]
+pub enum VectorMode {
+    #[serde(rename = "fetch")]
+    #[configurable(description = "something")]
+    Fetch,
+    #[serde(rename = "receive")]
+    #[configurable(description = "something")]
+    Receive,
+}
+
 /// Configuration for the `vector` source.
 #[configurable_component(source("vector", "Collect observability data from a Vector instance."))]
 #[derive(Clone, Debug)]
@@ -130,6 +180,11 @@ pub struct VectorConfig {
     /// It _must_ include a port.
     pub address: SocketAddr,
 
+    /// The mode of vector source
+    ///
+    /// push or pull
+    pub mode: VectorMode,
+
     #[configurable(derived)]
     #[serde(default)]
     tls: Option<TlsEnableableConfig>,
@@ -141,6 +196,9 @@ pub struct VectorConfig {
     #[configurable(derived)]
     #[serde(default)]
     keepalive: GrpcKeepaliveConfig,
+
+    /// Somrething something
+    pub healthcheck: SinkHealthcheckOptions,
 
     /// The namespace to use for logs. This overrides the global setting.
     #[serde(default)]
@@ -164,9 +222,11 @@ impl Default for VectorConfig {
             version: None,
             address: "0.0.0.0:6000".parse().unwrap(),
             tls: None,
+            mode: VectorMode::Receive,
             acknowledgements: Default::default(),
             keepalive: Default::default(),
             log_namespace: None,
+            healthcheck: Default::default(),
         }
     }
 }
@@ -177,53 +237,197 @@ impl GenerateConfig for VectorConfig {
     }
 }
 
+fn new_client(
+    tls_settings: &MaybeTlsSettings,
+    proxy_config: &ProxyConfig,
+) -> crate::Result<hyper::Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>> {
+    let proxy = build_proxy_connector(tls_settings.clone(), proxy_config)?;
+
+    Ok(hyper::Client::builder().http2_only(true).build(proxy))
+}
+
+pub fn with_default_scheme(address: &str, tls: bool) -> crate::Result<Uri> {
+    let uri: Uri = address.parse()?;
+    if uri.scheme().is_none() {
+        // Default the scheme to http or https.
+        let mut parts = uri.into_parts();
+
+        parts.scheme = if tls {
+            Some(
+                "https"
+                    .parse()
+                    .unwrap_or_else(|_| unreachable!("https should be valid")),
+            )
+        } else {
+            Some(
+                "http"
+                    .parse()
+                    .unwrap_or_else(|_| unreachable!("http should be valid")),
+            )
+        };
+
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some(
+                "/".parse()
+                    .unwrap_or_else(|_| unreachable!("root should be valid")),
+            );
+        }
+        Ok(Uri::from_parts(parts)?)
+    } else {
+        Ok(uri)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VectorGrpcRetryLogic;
+
+impl RetryLogic for VectorGrpcRetryLogic {
+    type Error = service::VectorSinkError;
+    type Request = service::VectorRequest;
+    type Response = service::VectorResponse;
+
+    fn is_retriable_error(&self, err: &Self::Error) -> bool {
+        use tonic::Code::*;
+
+        match err {
+            service::VectorSinkError::Request { source } => !matches!(
+                source.code(),
+                // List taken from
+                //
+                // <https://github.com/grpc/grpc/blob/ed1b20777c69bd47e730a63271eafc1b299f6ca0/doc/statuscodes.md>
+                NotFound
+                    | InvalidArgument
+                    | AlreadyExists
+                    | PermissionDenied
+                    | OutOfRange
+                    | Unimplemented
+                    | Unauthenticated
+                    | DataLoss
+            ),
+            _ => true,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 #[typetag::serde(name = "vector")]
 impl SourceConfig for VectorConfig {
-    async fn build(&self, cx: SourceContext) -> crate::Result<Source> {
+    async fn build(&self, mut cx: SourceContext) -> crate::Result<Source> {
         let tls_settings = MaybeTlsSettings::from_config(self.tls.as_ref(), true)?;
         let acknowledgements = cx.do_acknowledgements(self.acknowledgements);
         let log_namespace = cx.log_namespace(self.log_namespace);
 
-        // Create the custom Vector service (existing).
-        //
-        // Compression negotiation (gzip, zstd) is handled centrally by
-        // `DecompressionAndMetricsLayer` in `sources::util::grpc`, so we
-        // deliberately do not call `.accept_compressed(..)` here.
-        let vector_service = proto::Server::new(Service {
-            pipeline: cx.out,
-            acknowledgements,
-            log_namespace,
-        })
-        // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
-        .max_decoding_message_size(usize::MAX);
+        match self.mode {
+            VectorMode::Receive => {
+                // Create the custom Vector service (existing).
+                //
+                // Compression negotiation (gzip, zstd) is handled centrally by
+                // `DecompressionAndMetricsLayer` in `sources::util::grpc`, so we
+                // deliberately do not call `.accept_compressed(..)` here.
+                let vector_service = proto::Server::new(Service {
+                    pipeline: cx.out,
+                    acknowledgements,
+                    log_namespace,
+                })
+                // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
+                .max_decoding_message_size(usize::MAX);
 
-        // Create the standard gRPC health service
-        let (mut health_reporter, health_service) = health_reporter();
+                // Create the standard gRPC health service
+                let (mut health_reporter, health_service) = health_reporter();
 
-        // Register the Vector service as serving in the health reporter
-        health_reporter
-            .set_service_status("vector.Vector", tonic_health::ServingStatus::Serving)
-            .await;
+                // Register the Vector service as serving in the health reporter
+                health_reporter
+                    .set_service_status("vector.Vector", tonic_health::ServingStatus::Serving)
+                    .await;
 
-        // Combine both services using RoutesBuilder
-        let mut builder = RoutesBuilder::default();
-        builder
-            .add_service(health_service)
-            .add_service(vector_service);
+                // Combine both services using RoutesBuilder
+                let mut builder = RoutesBuilder::default();
+                builder
+                    .add_service(health_service)
+                    .add_service(vector_service);
 
-        let source = run_grpc_server_with_routes(
-            self.address,
-            tls_settings,
-            builder.routes(),
-            self.keepalive.clone(),
-            cx.shutdown,
-        )
-        .map_err(|error| {
-            error!(message = "Source future failed.", %error);
-        });
+                let source = run_grpc_server_with_routes(
+                    self.address,
+                    tls_settings,
+                    builder.routes(),
+                    self.keepalive.clone(),
+                    cx.shutdown,
+                )
+                .map_err(|error| {
+                    error!(message = "Source future failed.", %error);
+                });
 
-        Ok(Box::pin(source))
+                Ok(Box::pin(source))
+            }
+            VectorMode::Fetch => {
+                let client = new_client(&tls_settings, &cx.proxy).unwrap();
+                let uri = with_default_scheme(&format!("{}", self.address), tls_settings.is_tls())
+                    .unwrap();
+                let service = service::VectorService::new(client, uri, VectorCompression::None);
+                let mut service = ServiceBuilder::new()
+                    .settings(
+                        TowerRequestSettings {
+                            concurrency: None,
+                            timeout: std::time::Duration::from_secs(3),
+                            rate_limit_duration: std::time::Duration::from_secs(3),
+                            rate_limit_num: 100,
+                            retry_attempts: 10,
+                            retry_max_duration: std::time::Duration::from_secs(3),
+                            retry_initial_backoff: std::time::Duration::from_secs(3),
+                            adaptive_concurrency: AdaptiveConcurrencySettings::default(),
+                            retry_jitter_mode: JitterMode::default(),
+                        },
+                        VectorGrpcRetryLogic,
+                    )
+                    .service(service);
+                Ok(Box::pin(async move {
+                    let mut ready_service = tower::ServiceExt::ready(&mut service).await.unwrap();
+                    let mut stream = tower::Service::call(
+                        &mut ready_service,
+                        service::VectorRequest {
+                            finalizers: EventFinalizers::default(),
+                            metadata: RequestMetadata::default(),
+                            request: proto::PullEventsRequest {},
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    loop {
+                        tokio::select! {
+                            _ = &mut cx.shutdown => {
+                                println!("Shutdown signal received");
+                                break;
+                            }
+                            message_res = stream.message() => {
+                                match message_res {
+                                    Ok(Some(response)) => {
+                                        println!("Stream loop iteration");
+                                        let events = response
+                                            .events
+                                            .into_iter()
+                                            .map(Event::from)
+                                            .collect::<Vec<_>>();
+
+                                        if cx.out.clone().send_batch(events).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => {
+                                        println!("Stream closed by the remote server.");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Error reading from stream: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                }))
+            }
+        }
     }
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
@@ -240,7 +444,12 @@ impl SourceConfig for VectorConfig {
     }
 
     fn resources(&self) -> Vec<Resource> {
-        vec![Resource::tcp(self.address)]
+        match self.mode {
+            VectorMode::Receive => {
+                vec![Resource::tcp(self.address)]
+            }
+            VectorMode::Fetch => vec![],
+        }
     }
 
     fn can_acknowledge(&self) -> bool {

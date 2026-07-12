@@ -5,6 +5,7 @@ mod compression;
 mod config;
 mod service;
 mod sink;
+mod serve;
 
 pub use config::VectorConfig;
 

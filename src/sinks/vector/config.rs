@@ -1,10 +1,11 @@
+use futures::TryFutureExt;
 use http::Uri;
 use hyper::client::HttpConnector;
 use hyper_openssl::HttpsConnector;
 use hyper_proxy::ProxyConnector;
-use tonic::body::BoxBody;
+use tonic::{body::BoxBody, transport::server::RoutesBuilder};
 use tower::ServiceBuilder;
-use vector_lib::configurable::configurable_component;
+use vector_lib::{configurable::configurable_component, shutdown::ShutdownSignal};
 
 use super::{
     VectorSinkError,
@@ -26,8 +27,21 @@ use crate::{
             TowerRequestConfig, retries::RetryLogic,
         },
     },
+    sources::util::grpc::{GrpcKeepaliveConfig, run_grpc_server_with_routes},
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
+
+#[configurable_component()]
+#[configurable(description = "vector mode")]
+#[derive(Clone, Debug)]
+pub enum VectorMode {
+    #[serde(rename = "push")]
+    #[configurable(description = "something")]
+    Push,
+    #[serde(rename = "serve")]
+    #[configurable(description = "something")]
+    Serve,
+}
 
 /// Configuration for the `vector` sink.
 #[configurable_component(sink("vector", "Relay observability data to a Vector instance."))]
@@ -39,6 +53,9 @@ pub struct VectorConfig {
     // At some point in the future we will remove it entirely as a breaking change.
     #[configurable(metadata(docs::hidden))]
     version: Option<super::VectorConfigVersion>,
+
+    /// Mode
+    mode: VectorMode,
 
     /// The downstream Vector address to which to connect.
     ///
@@ -102,6 +119,7 @@ impl GenerateConfig for VectorConfig {
 fn default_config(address: &str) -> VectorConfig {
     VectorConfig {
         version: None,
+        mode: VectorMode::Push,
         address: address.to_owned(),
         compression: VectorCompression::None,
         batch: BatchConfig::default(),
@@ -116,36 +134,71 @@ fn default_config(address: &str) -> VectorConfig {
 impl SinkConfig for VectorConfig {
     async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSinkType, Healthcheck)> {
         let tls = MaybeTlsSettings::from_config(self.tls.as_ref(), false)?;
-        let uri = with_default_scheme(&self.address, tls.is_tls())?;
+        match self.mode {
+            VectorMode::Push => {
+                let uri = with_default_scheme(&self.address, tls.is_tls())?;
 
-        let client = new_client(&tls, cx.proxy())?;
+                let client = new_client(&tls, cx.proxy())?;
 
-        let healthcheck_uri = cx
-            .healthcheck
-            .uri
-            .clone()
-            .map(|uri| uri.uri)
-            .unwrap_or_else(|| uri.clone());
-        let healthcheck_client =
-            VectorService::new(client.clone(), healthcheck_uri, VectorCompression::None);
-        let healthcheck = healthcheck(healthcheck_client, cx.healthcheck);
-        let service = VectorService::new(client, uri, self.compression);
-        let request_settings = self.request.into_settings();
-        let batch_settings = self.batch.into_batcher_settings()?;
+                let healthcheck_uri = cx
+                    .healthcheck
+                    .uri
+                    .clone()
+                    .map(|uri| uri.uri)
+                    .unwrap_or_else(|| uri.clone());
+                let healthcheck_client =
+                    VectorService::new(client.clone(), healthcheck_uri, VectorCompression::None);
+                let healthcheck = healthcheck(healthcheck_client, cx.healthcheck);
+                let service = VectorService::new(client, uri, self.compression);
+                let request_settings = self.request.into_settings();
+                let batch_settings = self.batch.into_batcher_settings()?;
 
-        let service = ServiceBuilder::new()
-            .settings(request_settings, VectorGrpcRetryLogic)
-            .service(service);
+                let service = ServiceBuilder::new()
+                    .settings(request_settings, VectorGrpcRetryLogic)
+                    .service(service);
 
-        let sink = VectorSink {
-            batch_settings,
-            service,
-        };
+                let sink = VectorSink {
+                    batch_settings,
+                    service,
+                };
 
-        Ok((
-            VectorSinkType::from_event_streamsink(sink),
-            Box::pin(healthcheck),
-        ))
+                Ok((
+                    VectorSinkType::from_event_streamsink(sink),
+                    Box::pin(healthcheck),
+                ))
+            }
+            VectorMode::Serve => {
+                let (emitter, _) = tokio::sync::broadcast::channel(10000);
+                let service = super::serve::ServeService {
+                    emitter: emitter.clone(),
+                };
+                let proto_server =
+                    proto::Server::new(service).max_decoding_message_size(usize::MAX);
+                let mut builder = RoutesBuilder::default();
+                builder.add_service(proto_server);
+
+                let (shutdown_trigger, shutdown_signal, _) = ShutdownSignal::new_wired();
+                let source = run_grpc_server_with_routes(
+                    self.address.parse::<std::net::SocketAddr>().unwrap(),
+                    tls,
+                    builder.routes(),
+                    GrpcKeepaliveConfig::default(),
+                    shutdown_signal,
+                )
+                .map_err(|error| {
+                    error!(message = "Sink serve future failed.", %error);
+                });
+                tokio::spawn(source);
+                Ok((
+                    VectorSinkType::from_event_streamsink(super::serve::ServeSink {
+                        emitter,
+                        batch_settings: self.batch.into_batcher_settings()?,
+                        shutdown_trigger,
+                    }),
+                    Box::pin(async { Ok(()) }),
+                ))
+            }
+        }
     }
 
     fn input(&self) -> Input {
