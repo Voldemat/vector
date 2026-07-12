@@ -91,7 +91,11 @@ impl vector_lib::sink::StreamSink<crate::event::Event> for ServeSink {
             }),
         )));
         while let Some(batch) = futures::StreamExt::next(&mut batched_stream).await {
-            let _ = self.emitter.send(batch.events);
+            if self.emitter.send(batch.events).is_err() {
+                batch
+                    .finalizers
+                    .update_status(vector_lib::event::EventStatus::Rejected)
+            };
         }
         self.shutdown_trigger.cancel();
         Ok(())

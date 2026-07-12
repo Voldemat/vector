@@ -1,0 +1,174 @@
+use vector_lib::{event::Event, source::Source};
+
+use crate::{
+    config::SourceContext,
+    proto::vector as proto,
+    sinks::{
+        prelude::RetryLogic,
+        util::{
+            ServiceBuilderExt, TowerRequestSettings,
+            adaptive_concurrency::{AdaptiveConcurrencyLimit, AdaptiveConcurrencySettings},
+            retries::{FibonacciRetryPolicy, JitterMode},
+        },
+    },
+};
+mod service;
+mod compression;
+
+fn new_client(
+    tls_settings: &vector_lib::tls::MaybeTlsSettings,
+    proxy_config: &vector_lib::config::proxy::ProxyConfig,
+) -> crate::Result<
+    hyper::Client<
+        hyper_proxy::ProxyConnector<hyper_openssl::HttpsConnector<hyper::client::HttpConnector>>,
+        tonic::body::BoxBody,
+    >,
+> {
+    let proxy = crate::http::build_proxy_connector(tls_settings.clone(), proxy_config)?;
+
+    Ok(hyper::Client::builder().http2_only(true).build(proxy))
+}
+
+pub fn with_default_scheme(address: &str, tls: bool) -> crate::Result<http::Uri> {
+    let uri = address.parse::<http::Uri>()?;
+    if uri.scheme().is_none() {
+        // Default the scheme to http or https.
+        let mut parts = uri.into_parts();
+
+        parts.scheme = if tls {
+            Some(
+                "https"
+                    .parse()
+                    .unwrap_or_else(|_| unreachable!("https should be valid")),
+            )
+        } else {
+            Some(
+                "http"
+                    .parse()
+                    .unwrap_or_else(|_| unreachable!("http should be valid")),
+            )
+        };
+
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some(
+                "/".parse()
+                    .unwrap_or_else(|_| unreachable!("root should be valid")),
+            );
+        }
+        Ok(http::Uri::from_parts(parts)?)
+    } else {
+        Ok(uri)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VectorGrpcRetryLogic;
+
+impl RetryLogic for VectorGrpcRetryLogic {
+    type Error = service::PullEventsRequestError;
+    type Request = proto::PullEventsRequest;
+    type Response = tonic::Streaming<proto::PullEventsResponse>;
+
+    fn is_retriable_error(&self, err: &Self::Error) -> bool {
+        !matches!(
+            err.status.code(),
+            // List taken from
+            //
+            // <https://github.com/grpc/grpc/blob/ed1b20777c69bd47e730a63271eafc1b299f6ca0/doc/statuscodes.md>
+            tonic::Code::NotFound
+                | tonic::Code::InvalidArgument
+                | tonic::Code::AlreadyExists
+                | tonic::Code::PermissionDenied
+                | tonic::Code::OutOfRange
+                | tonic::Code::Unimplemented
+                | tonic::Code::Unauthenticated
+                | tonic::Code::DataLoss
+        )
+    }
+}
+
+type TowerService = tower::limit::RateLimit<
+    AdaptiveConcurrencyLimit<
+        tower::retry::Retry<
+            FibonacciRetryPolicy<VectorGrpcRetryLogic>,
+            tower::timeout::Timeout<service::VectorService>,
+        >,
+        VectorGrpcRetryLogic,
+    >,
+>;
+
+async fn run_pull_events_stream(
+    service: &mut TowerService,
+    cx: &mut SourceContext,
+) -> Result<(), ()> {
+    let mut ready_service = tower::ServiceExt::ready(service).await.unwrap();
+    let mut stream = tower::Service::call(&mut ready_service, proto::PullEventsRequest {})
+        .await
+        .map_err(|e| {
+            error!(message = "Failed to call grpc pull_events handler", %e);
+            ()
+        })?;
+    loop {
+        tokio::select! {
+            _ = &mut cx.shutdown => {
+                break;
+            }
+            message_res = stream.message() => {
+                match message_res {
+                    Ok(Some(response)) => {
+                        let events = response
+                            .events
+                            .into_iter()
+                            .map(Event::from)
+                            .collect::<Vec<_>>();
+
+                        if cx.out.clone().send_batch(events).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(_) => {
+                        error!("Error reading from stream");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn config_to_fetch_source(
+    config: &super::VectorConfig,
+    tls_settings: &vector_lib::tls::MaybeTlsSettings,
+    mut cx: SourceContext,
+) -> crate::Result<Source> {
+    let client = new_client(&tls_settings, &cx.proxy)?;
+    let uri = with_default_scheme(&format!("{}", config.address), tls_settings.is_tls())?;
+    let service = service::VectorService::new(
+        client,
+        uri,
+        compression::VectorCompression::Gzip,
+    );
+    let mut service = tower::ServiceBuilder::new()
+        .settings(
+            TowerRequestSettings {
+                concurrency: None,
+                timeout: std::time::Duration::from_secs(3),
+                rate_limit_duration: std::time::Duration::from_secs(3),
+                rate_limit_num: 100,
+                retry_attempts: 10,
+                retry_max_duration: std::time::Duration::from_secs(3),
+                retry_initial_backoff: std::time::Duration::from_secs(3),
+                adaptive_concurrency: AdaptiveConcurrencySettings::default(),
+                retry_jitter_mode: JitterMode::default(),
+            },
+            VectorGrpcRetryLogic,
+        )
+        .service(service);
+    Ok(Box::pin(async move {
+        run_pull_events_stream(&mut service, &mut cx).await
+    }))
+}
