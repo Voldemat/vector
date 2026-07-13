@@ -6,14 +6,14 @@ use crate::{
     sinks::{
         prelude::RetryLogic,
         util::{
-            ServiceBuilderExt, TowerRequestSettings,
-            adaptive_concurrency::{AdaptiveConcurrencyLimit, AdaptiveConcurrencySettings},
-            retries::{FibonacciRetryPolicy, JitterMode},
+            ServiceBuilderExt,
+            adaptive_concurrency::{AdaptiveConcurrencyLimit},
+            retries::{FibonacciRetryPolicy},
         },
     },
 };
+pub mod compression;
 mod service;
-mod compression;
 
 fn new_client(
     tls_settings: &vector_lib::tls::MaybeTlsSettings,
@@ -147,26 +147,9 @@ pub fn config_to_fetch_source(
 ) -> crate::Result<Source> {
     let client = new_client(&tls_settings, &cx.proxy)?;
     let uri = with_default_scheme(&format!("{}", config.address), tls_settings.is_tls())?;
-    let service = service::VectorService::new(
-        client,
-        uri,
-        compression::VectorCompression::Gzip,
-    );
+    let service = service::VectorService::new(client, uri, config.compression);
     let mut service = tower::ServiceBuilder::new()
-        .settings(
-            TowerRequestSettings {
-                concurrency: None,
-                timeout: std::time::Duration::from_secs(3),
-                rate_limit_duration: std::time::Duration::from_secs(3),
-                rate_limit_num: 100,
-                retry_attempts: 10,
-                retry_max_duration: std::time::Duration::from_secs(3),
-                retry_initial_backoff: std::time::Duration::from_secs(3),
-                adaptive_concurrency: AdaptiveConcurrencySettings::default(),
-                retry_jitter_mode: JitterMode::default(),
-            },
-            VectorGrpcRetryLogic,
-        )
+        .settings(config.request.into_settings(), VectorGrpcRetryLogic)
         .service(service);
     Ok(Box::pin(async move {
         run_pull_events_stream(&mut service, &mut cx).await

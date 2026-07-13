@@ -13,7 +13,7 @@ use vector_lib::{
     stream::DriverResponse,
 };
 
-use super::{VectorSinkError, compression::VectorCompression};
+use super::{compression::VectorCompression};
 use crate::{
     Error,
     event::{EventFinalizers, EventStatus, Finalizable},
@@ -125,7 +125,7 @@ impl Service<VectorRequest> for VectorService {
 
                     VectorResponse { events_byte_size }
                 })
-                .map_err(|source| VectorSinkError::Request { source }.into())
+                .map_err(|source| super::sink_error::VectorSinkError::Request { source }.into())
                 .await
         };
 

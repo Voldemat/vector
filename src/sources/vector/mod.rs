@@ -13,6 +13,7 @@ use crate::{
         SourceConfig, SourceContext, SourceOutput,
     },
     serde::bool_or_struct,
+    sinks::util::TowerRequestConfig,
     sources::{Source, util::grpc::GrpcKeepaliveConfig},
     tls::{MaybeTlsSettings, TlsEnableableConfig},
 };
@@ -63,6 +64,15 @@ pub struct VectorConfig {
     #[serde(default)]
     pub mode: VectorMode,
 
+    /// Vector compression mode in pull mode
+    #[serde(default)]
+    pub compression: fetch::compression::VectorCompression,
+
+    /// Vector request config in pull mode
+    #[configurable(derived)]
+    #[serde(default)]
+    pub request: TowerRequestConfig,
+
     #[configurable(derived)]
     #[serde(default)]
     tls: Option<TlsEnableableConfig>,
@@ -102,6 +112,8 @@ impl Default for VectorConfig {
             address: "0.0.0.0:6000".parse().unwrap(),
             tls: None,
             mode: VectorMode::Receive,
+            compression: fetch::compression::VectorCompression::default(),
+            request: TowerRequestConfig::default(),
             acknowledgements: Default::default(),
             keepalive: Default::default(),
             log_namespace: None,
@@ -350,8 +362,8 @@ mod tests {
 
     #[tokio::test]
     async fn custom_health_check_works() {
-        use tonic::transport::Channel;
         use crate::proto::vector as proto;
+        use tonic::transport::Channel;
 
         let (_guard, addr) = test_util::addr::next_addr();
 
@@ -388,9 +400,9 @@ mod tests {
 
     #[tokio::test]
     async fn max_connection_age_allows_client_reconnect() {
+        use crate::proto::vector as proto;
         use tokio::time::{Duration, sleep};
         use tonic::transport::Channel;
-        use crate::proto::vector as proto;
 
         use crate::sources::util::grpc::test_support::{
             max_connection_age_connection_observations,

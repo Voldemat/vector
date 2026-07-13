@@ -1,5 +1,5 @@
 use crate::{proto::vector as proto, sinks::util::SinkBuilderExt};
-use futures::stream::BoxStream;
+use futures::{TryFutureExt, stream::BoxStream};
 use stream_cancel::Trigger;
 use vector_lib::{
     ByteSizeOf,
@@ -100,4 +100,50 @@ impl vector_lib::sink::StreamSink<crate::event::Event> for ServeSink {
         self.shutdown_trigger.cancel();
         Ok(())
     }
+}
+
+pub async fn config_to_serve_sink(
+    config: &super::config::VectorConfig,
+) -> crate::Result<(crate::sinks::VectorSink, crate::sinks::Healthcheck)> {
+    let tls = vector_lib::tls::MaybeTlsSettings::from_config(config.tls.as_ref(), false)?;
+    let (emitter, _) = tokio::sync::broadcast::channel(10000);
+    let service = super::serve::ServeService {
+        emitter: emitter.clone(),
+    };
+    let proto_server = proto::Server::new(service).max_decoding_message_size(usize::MAX);
+
+    let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
+
+    health_reporter
+        .set_service_status("vector.Vector", tonic_health::ServingStatus::Serving)
+        .await;
+    let mut builder = tonic::transport::server::RoutesBuilder::default();
+    builder.add_service(proto_server);
+    builder.add_service(health_service);
+
+    let (shutdown_trigger, shutdown_signal, _) = vector_lib::shutdown::ShutdownSignal::new_wired();
+    let source = crate::sources::util::grpc::run_grpc_server_with_routes(
+        config
+            .address
+            .as_ref()
+            .ok_or_else(|| -> crate::Error { "address must be defined if mode is serve".into() })?
+            .parse::<std::net::SocketAddr>()
+            .map_err(|_| -> crate::Error { "failed to parse address into SocketAddr".into() })?,
+        tls,
+        builder.routes(),
+        crate::sources::util::grpc::GrpcKeepaliveConfig::default(),
+        shutdown_signal,
+    )
+    .map_err(|error| {
+        error!(message = "Sink serve future failed.", %error);
+    });
+    tokio::spawn(source);
+    Ok((
+        crate::sinks::VectorSink::from_event_streamsink(super::serve::ServeSink {
+            emitter,
+            batch_settings: config.batch.into_batcher_settings()?,
+            shutdown_trigger,
+        }),
+        Box::pin(async { Ok(()) }),
+    ))
 }
