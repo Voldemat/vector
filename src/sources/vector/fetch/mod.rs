@@ -1,4 +1,7 @@
-use vector_lib::{event::Event, source::Source};
+use vector_lib::{
+    EstimatedJsonEncodedSizeOf, event::Event, internal_event::InternalEventHandle, source::Source,
+    source_sender::SourceSender,
+};
 
 use crate::{
     config::SourceContext,
@@ -6,9 +9,8 @@ use crate::{
     sinks::{
         prelude::RetryLogic,
         util::{
-            ServiceBuilderExt,
-            adaptive_concurrency::{AdaptiveConcurrencyLimit},
-            retries::{FibonacciRetryPolicy},
+            ServiceBuilderExt, adaptive_concurrency::AdaptiveConcurrencyLimit,
+            retries::FibonacciRetryPolicy,
         },
     },
 };
@@ -99,7 +101,8 @@ type TowerService = tower::limit::RateLimit<
 
 async fn run_pull_events_stream(
     service: &mut TowerService,
-    cx: &mut SourceContext,
+    pipeline: &mut SourceSender,
+    log_namespace: &vector_lib::config::LogNamespace,
 ) -> Result<(), ()> {
     let mut ready_service = tower::ServiceExt::ready(service).await.unwrap();
     let mut stream = tower::Service::call(&mut ready_service, proto::PullEventsRequest {})
@@ -109,31 +112,40 @@ async fn run_pull_events_stream(
             ()
         })?;
     loop {
-        tokio::select! {
-            _ = &mut cx.shutdown => {
-                break;
-            }
-            message_res = stream.message() => {
-                match message_res {
-                    Ok(Some(response)) => {
-                        let events = response
-                            .events
-                            .into_iter()
-                            .map(Event::from)
-                            .collect::<Vec<_>>();
+        match stream.message().await {
+            Ok(Some(response)) => {
+                let mut events = response
+                    .events
+                    .into_iter()
+                    .map(Event::from)
+                    .collect::<Vec<_>>();
 
-                        if cx.out.clone().send_batch(events).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => {
-                        break;
-                    }
-                    Err(_) => {
-                        error!("Error reading from stream");
-                        break;
+                let now = chrono::Utc::now();
+                for event in &mut events {
+                    if let Event::Log(log) = event {
+                        log_namespace.insert_standard_vector_source_metadata(
+                            log,
+                            super::VectorConfig::NAME,
+                            now,
+                        );
                     }
                 }
+
+                let count = events.len();
+                let byte_size = events.estimated_json_encoded_size_of();
+                let events_received = register!(vector_lib::internal_event::EventsReceived);
+                events_received.emit(vector_lib::internal_event::CountByteSize(count, byte_size));
+
+                if pipeline.clone().send_batch(events).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => {
+                break;
+            }
+            Err(_) => {
+                error!("Error reading from stream");
+                break;
             }
         }
     }
@@ -143,7 +155,8 @@ async fn run_pull_events_stream(
 pub fn config_to_fetch_source(
     config: &super::VectorConfig,
     tls_settings: &vector_lib::tls::MaybeTlsSettings,
-    mut cx: SourceContext,
+    cx: SourceContext,
+    retry_count: usize,
 ) -> crate::Result<Source> {
     let client = new_client(&tls_settings, &cx.proxy)?;
     let uri = with_default_scheme(&format!("{}", config.address), tls_settings.is_tls())?;
@@ -151,7 +164,20 @@ pub fn config_to_fetch_source(
     let mut service = tower::ServiceBuilder::new()
         .settings(config.request.into_settings(), VectorGrpcRetryLogic)
         .service(service);
+    let mut log_namespace = cx.log_namespace(config.log_namespace);
+    let mut shutdown = cx.shutdown;
+    let mut pipeline = cx.out;
     Ok(Box::pin(async move {
-        run_pull_events_stream(&mut service, &mut cx).await
+        for _ in 0..retry_count {
+            tokio::select! {
+                _ = &mut shutdown => {
+                    break;
+                }
+                _ = run_pull_events_stream(
+                    &mut service, &mut pipeline, &mut log_namespace
+                ) => {}
+            }
+        }
+        Ok(())
     }))
 }

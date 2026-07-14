@@ -29,7 +29,8 @@ impl VectorService {
         });
 
         if let Some(encoding) = compression.as_tonic_encoding() {
-            proto_client = proto_client.send_compressed(encoding);
+            proto_client = proto_client.send_compressed(encoding)
+                .accept_compressed(encoding);
         }
 
         Self {

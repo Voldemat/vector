@@ -136,7 +136,7 @@ impl SourceConfig for VectorConfig {
 
         match self.mode {
             VectorMode::Receive => receive::config_to_receive_source(self, tls_settings, cx).await,
-            VectorMode::Fetch => fetch::config_to_fetch_source(self, &tls_settings, cx),
+            VectorMode::Fetch => fetch::config_to_fetch_source(self, &tls_settings, cx, 5),
         }
     }
 
