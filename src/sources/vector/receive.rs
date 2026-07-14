@@ -14,6 +14,7 @@ use crate::config::SourceContext;
 use crate::internal_events::StreamClosedError;
 use crate::proto::vector as proto;
 use crate::sources::util::grpc::run_grpc_server_with_routes;
+use crate::sources::util::decompression::max_decompressed_size_bytes;
 
 #[derive(Debug, Clone)]
 struct Service {
@@ -130,7 +131,7 @@ pub async fn config_to_receive_source(
         log_namespace,
     })
     // Tonic added a default of 4MB in 0.9. This replaces the old behavior.
-    .max_decoding_message_size(usize::MAX);
+    .max_decoding_message_size(max_decompressed_size_bytes());
 
     // Create the standard gRPC health service
     let (mut health_reporter, health_service) = health_reporter();
